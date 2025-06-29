@@ -1,112 +1,66 @@
-import asyncio
-import aiohttp
+from flask import Flask, request, jsonify
 import redis.asyncio as redis
-from aiohttp import web
-import logging
+import httpx
+import asyncio
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-
-# Redis client
+app = Flask(__name__)
 redis_client = redis.Redis()
 
-# Strategy options: round_robin or least_conn
-STRATEGY = "round_robin"
-
-# Redis keys
 REDIS_KEY_SERVERS = "backend_servers"
 REDIS_CONN_PREFIX = "conn_count:"
 REDIS_RR_COUNTER = "rr_counter"
+DEFAULT_STRATEGY = "round_robin"
 
-# Round-robin load balancing
+# Async Redis logic
 async def round_robin():
     servers = await redis_client.lrange(REDIS_KEY_SERVERS, 0, -1)
     if not servers:
-        logging.error("No servers found in Redis")
         return None
+    index = (await redis_client.incr(REDIS_RR_COUNTER) - 1) % len(servers)
+    return servers[index].decode()
 
-    total_servers = len(servers)
-    counter = await redis_client.incr(REDIS_RR_COUNTER)
-    index = (counter - 1) % total_servers
-    selected = servers[index].decode()
-    logging.info(f"[Round Robin] Selected: {selected}")
-    return selected
-
-# Least-connections load balancing
 async def least_conn():
     servers = await redis_client.lrange(REDIS_KEY_SERVERS, 0, -1)
-    if not servers:
-        logging.error("No servers found in Redis")
-        return None
+    min_conn, selected = float('inf'), None
+    for s in servers:
+        server = s.decode()
+        conn = await redis_client.get(f"{REDIS_CONN_PREFIX}{server}") or 0
+        conn = int(conn)
+        if conn < min_conn:
+            min_conn = conn
+            selected = server
+    return selected
 
-    min_conn = float('inf')
-    selected_server = None
-
-    for server_bytes in servers:
-        server = server_bytes.decode()
-        key = f"{REDIS_CONN_PREFIX}{server}"
-        try:
-            conn_count = await redis_client.get(key)
-            conn_count = int(conn_count) if conn_count else 0
-        except Exception as e:
-            logging.warning(f"Failed to get connection count for {server}: {e}")
-            conn_count = 0
-
-        if conn_count < min_conn:
-            min_conn = conn_count
-            selected_server = server
-
-    logging.info(f"[Least Conn] Selected: {selected_server} (Connections: {min_conn})")
-    return selected_server
-
-# Increment and decrement connection counts
 async def increment_conn(server):
-    key = f"{REDIS_CONN_PREFIX}{server}"
-    await redis_client.incr(key)
+    await redis_client.incr(f"{REDIS_CONN_PREFIX}{server}")
 
 async def decrement_conn(server):
-    key = f"{REDIS_CONN_PREFIX}{server}"
-    await redis_client.decr(key)
+    await redis_client.decr(f"{REDIS_CONN_PREFIX}{server}")
 
-# Proxy handler
-async def handle_proxy(request):
-    logging.info("Incoming request to /proxy")
+# Async route handler
+@app.route('/proxy', methods=['POST'])
+async def proxy():
+    strategy = request.args.get('strategy', DEFAULT_STRATEGY)
 
-    strategy = request.query.get("strategy", STRATEGY)
+    if strategy == 'round_robin':
+        server = await round_robin()
+    elif strategy == 'least_conn':
+        server = await least_conn()
+    else:
+        return jsonify({"error": "Invalid strategy"}), 400
+
+    if not server:
+        return jsonify({"error": "No backend servers available"}), 500
+
+    backend_url = f"{server}/process"
 
     try:
-        if strategy == "round_robin":
-            server = await round_robin()
-        elif strategy == "least_conn":
-            server = await least_conn()
-        else:
-            return web.Response(text="Unsupported strategy", status=400)
-
-        if not server:
-            return web.Response(text="No backend servers available", status=500)
-
-        logging.info(f"Forwarding request to: {server}")
-
-        try:
-            await increment_conn(server)
-            async with aiohttp.ClientSession() as session:
-                async with session.post(f"{server}/process") as resp:
-                    data = await resp.text()
-                    return web.Response(text=f"Response from: {server}\n\n{data}")
-        except Exception as e:
-            logging.error(f"Error forwarding to backend: {e}")
-            return web.Response(text=f"Error forwarding to backend: {e}", status=500)
-        finally:
-            await decrement_conn(server)
-
+        await increment_conn(server)
+        async with httpx.AsyncClient() as client:
+            response = await client.post(backend_url)
+            return f"Response from {server}:\n\n{response.text}"
     except Exception as e:
-        logging.error(f"Unexpected error: {e}")
-        return web.Response(text=f"Internal Server Error: {e}", status=500)
+        return jsonify({"error": str(e)}), 500
+    finally:
+        await decrement_conn(server)
 
-# Aiohttp web app
-app = web.Application()
-app.add_routes([web.post('/proxy', handle_proxy)])
-
-# Run server
-if __name__ == '__main__':
-    web.run_app(app, host='0.0.0.0', port=5000)
